@@ -7,7 +7,7 @@ from typing import Union, Tuple, List, Optional, Literal
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-from gensim.models.word2vec import Word2Vec
+from gensim.models import Word2Vec
 from negima import MorphemeMerger
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.feature_extraction.text import CountVectorizer, _document_frequency
