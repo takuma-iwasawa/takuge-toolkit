@@ -1,20 +1,29 @@
 # -*- coding: utf-8 -*-
-from typing import Dict, Any, NoReturn
+from logging import getLogger
+from typing import Dict, Any, NoReturn, List
 from pathlib import PurePosixPath
 from warnings import warn
 from copy import deepcopy
 from io import StringIO
+import json
+import os
+from itertools import chain
 
 import fsspec
 from kedro.io.core import (
     AbstractVersionedDataSet,
+    AbstractDataSet,
     Version,
     get_filepath_str,
     get_protocol_and_path,
     DataSetError
 )
-
+import pandas as pd
+import numpy as np
 import pyLDAvis
+from gensim.models.word2vec import LineSentence
+
+logger = getLogger(__name__)
 
 
 class PyLDAVisWriter(AbstractVersionedDataSet):
@@ -114,6 +123,304 @@ class PyLDAVisWriter(AbstractVersionedDataSet):
 
         with self._fs.open(full_key_path, **self._fs_open_args_save) as fs_file:
             fs_file.write(buffer.getvalue())
+
+    def _exists(self) -> bool:
+        load_path = get_filepath_str(self._get_load_path(), self._protocol)
+        return self._fs.exists(load_path)
+
+
+class ExportedDynamoDBDataset(AbstractDataSet):
+    """参考: https://github.com/kedro-org/kedro/discussions/973"""
+    DEFAULT_LOAD_ARGS = {}  # type: Dict[str, Any]
+
+    def __init__(self, filepath: str, export_version: str, load_args: Dict[str, Any] = None,
+                 credentials: Dict[str, Any] = None, fs_args: Dict[str, Any] = None) -> None:
+        self._filepath = os.path.join(filepath, 'AWSDynamoDB', export_version, 'data')
+        _credentials = deepcopy(credentials) or {}
+        _fs_args = deepcopy(fs_args) or {}
+
+        protocol, path = get_protocol_and_path(self._filepath)
+        if protocol == "file":
+            _fs_args.setdefault("auto_mkdir", True)
+
+        self._protocol = protocol
+        self._fs = fsspec.filesystem(self._protocol, **_credentials, **_fs_args)
+
+        # Handle default load and save arguments
+        self._load_args = deepcopy(self.DEFAULT_LOAD_ARGS)
+        if load_args is not None:
+            self._load_args.update(load_args)
+
+    def _describe(self) -> Dict[str, Any]:
+        return dict(filepath=self._filepath, load_args=self._load_args)
+
+    def _save(self, data: Dict) -> None:
+        raise DataSetError(f"Saving not supported for '{self.__class__.__name__}'")
+
+    def _load(self) -> pd.DataFrame:
+        filepaths = self._fs.ls(self._filepath)
+        logger.info(f'Target jsons to load are: {filepaths}')
+
+        items = list()
+        for filepath in filepaths:
+            logger.info(f'Loading json: {filepath}')
+
+            with self._fs.open(filepath, 'r', compression='gzip') as f:
+                line = f.readline()
+                while line:
+                    item = json.loads(line)['Item']
+                    items.append(pd.json_normalize(item, **self._load_args))
+                    line = f.readline()
+
+        df = pd.concat(items, axis=0)
+        for col in [c for c in df.columns if c.endswith('.L')]:
+            df[col] = df[col].apply(
+                lambda l: list(chain.from_iterable(d.values() for d in l)) if np.all(pd.notnull(l)) else np.nan)
+
+        return df
+
+    def _exists(self) -> bool:
+        return self._fs.exists(self._filepath)
+
+
+class LineSentenceDataset(AbstractVersionedDataSet):
+    DEFAULT_SAVE_ARGS = {}  # type: Dict[str, Any]
+
+    def __init__(
+            self,
+            filepath: str,
+            fs_args: Dict[str, Any] = None,
+            credentials: Dict[str, Any] = None,
+            save_args: Dict[str, Any] = None,
+            version: Version = None,
+            overwrite: bool = False,
+    ) -> None:
+        """Creates a new instance of ``LineSentenceDataset``.
+        Args:
+            filepath: Filepath in POSIX format to save pyLDAvis objects to, prefixed with a
+                protocol like `s3://`. If prefix is not provided, `file` protocol (local filesystem)
+                will be used. The prefix should be any protocol supported by ``fsspec``.
+            fs_args: Extra arguments to pass into underlying filesystem class constructor
+                (e.g. `{"project": "my-project"}` for ``GCSFileSystem``), as well as
+                to pass to the filesystem's `open` method through nested key `open_args_save`.
+                Here you can find all available arguments for `open`:
+                https://filesystem-spec.readthedocs.io/en/latest/api.html#fsspec.spec.AbstractFileSystem.open
+                All defaults are preserved, except `mode`, which is set to `wb` when saving.
+            credentials: Credentials required to get access to the underlying filesystem.
+                E.g. for ``S3FileSystem`` it should look like:
+                `{'key': '<id>', 'secret': '<key>'}}`
+            save_args: Save args.
+            version: If specified, should be an instance of
+                ``kedro.io.core.Version``. If its ``load`` attribute is
+                None, the latest version will be loaded. If its ``save``
+                attribute is None, save version will be autogenerated.
+            overwrite: If True, any existing image files will be removed.
+                Only relevant when saving multiple pyLDAvis objects at
+                once.
+        """
+        _credentials = deepcopy(credentials) or {}
+        _fs_args = deepcopy(fs_args) or {}
+        _fs_open_args_save = _fs_args.pop("open_args_save", {})
+        _fs_open_args_save.setdefault("mode", "w")
+
+        protocol, path = get_protocol_and_path(filepath, version)
+        if protocol == "file":
+            _fs_args.setdefault("auto_mkdir", True)
+
+        self._protocol = protocol
+        self._fs = fsspec.filesystem(self._protocol, **_credentials, **_fs_args)
+
+        super().__init__(
+            filepath=PurePosixPath(path),
+            version=version,
+            exists_function=self._fs.exists,
+            glob_function=self._fs.glob,
+        )
+
+        self._fs_open_args_save = _fs_open_args_save
+
+        # Handle default save arguments
+        self._save_args = deepcopy(self.DEFAULT_SAVE_ARGS)
+        if save_args is not None:
+            self._save_args.update(save_args)
+
+        if overwrite and version is not None:
+            warn(
+                "Setting 'overwrite=True' is ineffective if versioning "
+                "is enabled, since the versioned path must not already "
+                "exist; overriding flag with 'overwrite=False' instead."
+            )
+            overwrite = False
+        self._overwrite = overwrite
+
+    def _describe(self) -> Dict[str, Any]:
+        return dict(
+            filepath=self._filepath,
+            protocol=self._protocol,
+            save_args=self._save_args,
+            version=self._version,
+        )
+
+    def _load(self) -> LineSentence:
+        load_path = self._get_load_path()
+        full_key_path = self._protocol + '://' + get_filepath_str(load_path, self._protocol)
+        return LineSentence(source=full_key_path)
+
+    def _save(self, line_sentence: List[str]) -> None:
+        save_path = self._get_save_path()
+
+        if self._overwrite and self._exists():
+            self._fs.rm(get_filepath_str(save_path, self._protocol), recursive=True)
+
+        full_key_path = get_filepath_str(save_path, self._protocol)
+        self._save_to_fs(full_key_path=full_key_path, line_sentence=line_sentence)
+
+    def _save_to_fs(self, full_key_path: str, line_sentence: List[str]):
+        with self._fs.open(full_key_path, **self._fs_open_args_save) as fs_file:
+            fs_file.writelines('\n'.join(line_sentence))
+
+    def _exists(self) -> bool:
+        load_path = get_filepath_str(self._get_load_path(), self._protocol)
+        return self._fs.exists(load_path)
+
+
+class VersionedPathDataset(AbstractVersionedDataSet):
+    """VersioningしたDataSetのfilepathを返す"""
+    DEFAULT_SAVE_ARGS = {}  # type: Dict[str, Any]
+
+    def __init__(
+            self,
+            filepath: str,
+            fs_args: Dict[str, Any] = None,
+            credentials: Dict[str, Any] = None,
+            version: Version = None,
+    ) -> None:
+        _credentials = deepcopy(credentials) or {}
+        _fs_args = deepcopy(fs_args) or {}
+
+        protocol, path = get_protocol_and_path(filepath, version)
+        if protocol == "file":
+            _fs_args.setdefault("auto_mkdir", True)
+
+        self._protocol = protocol
+        self._fs = fsspec.filesystem(self._protocol, **_credentials, **_fs_args)
+
+        super().__init__(
+            filepath=PurePosixPath(path),
+            version=version,
+            exists_function=self._fs.exists,
+            glob_function=self._fs.glob,
+        )
+
+    def _describe(self) -> Dict[str, Any]:
+        return dict(
+            filepath=self._filepath,
+            protocol=self._protocol,
+            version=self._version,
+        )
+
+    def _load(self) -> str:
+        load_path = self._get_load_path()
+        return self._protocol + '://' + get_filepath_str(load_path, self._protocol)
+
+    def _save(self, line_sentence: List[str]) -> None:
+        raise DataSetError(f"Saving not supported for '{self.__class__.__name__}'")
+
+    def _exists(self) -> bool:
+        load_path = get_filepath_str(self._get_load_path(), self._protocol)
+        return self._fs.exists(load_path)
+
+
+class HTMLWriter(AbstractVersionedDataSet):
+    DEFAULT_SAVE_ARGS = {}  # type: Dict[str, Any]
+
+    def __init__(
+            self,
+            filepath: str,
+            fs_args: Dict[str, Any] = None,
+            credentials: Dict[str, Any] = None,
+            save_args: Dict[str, Any] = None,
+            version: Version = None,
+            overwrite: bool = False,
+    ) -> None:
+        """Creates a new instance of ``HTMLWriter``.
+        Args:
+            filepath: Filepath in POSIX format to save HTML objects to, prefixed with a
+                protocol like `s3://`. If prefix is not provided, `file` protocol (local filesystem)
+                will be used. The prefix should be any protocol supported by ``fsspec``.
+            fs_args: Extra arguments to pass into underlying filesystem class constructor
+                (e.g. `{"project": "my-project"}` for ``GCSFileSystem``), as well as
+                to pass to the filesystem's `open` method through nested key `open_args_save`.
+                Here you can find all available arguments for `open`:
+                https://filesystem-spec.readthedocs.io/en/latest/api.html#fsspec.spec.AbstractFileSystem.open
+                All defaults are preserved, except `mode`, which is set to `wb` when saving.
+            credentials: Credentials required to get access to the underlying filesystem.
+                E.g. for ``S3FileSystem`` it should look like:
+                `{'key': '<id>', 'secret': '<key>'}}`
+            save_args: Save args passed to `HTML.save_html`.
+            version: If specified, should be an instance of
+                ``kedro.io.core.Version``. If its ``load`` attribute is
+                None, the latest version will be loaded. If its ``save``
+                attribute is None, save version will be autogenerated.
+            overwrite: If True, any existing image files will be removed.
+                Only relevant when saving multiple HTML objects at
+                once.
+        """
+        _credentials = deepcopy(credentials) or {}
+        _fs_args = deepcopy(fs_args) or {}
+        _fs_open_args_save = _fs_args.pop("open_args_save", {})
+        _fs_open_args_save.setdefault("mode", "w")
+
+        protocol, path = get_protocol_and_path(filepath, version)
+        if protocol == "file":
+            _fs_args.setdefault("auto_mkdir", True)
+
+        self._protocol = protocol
+        self._fs = fsspec.filesystem(self._protocol, **_credentials, **_fs_args)
+
+        super().__init__(
+            filepath=PurePosixPath(path),
+            version=version,
+            exists_function=self._fs.exists,
+            glob_function=self._fs.glob,
+        )
+
+        self._fs_open_args_save = _fs_open_args_save
+
+        # Handle default save arguments
+        self._save_args = deepcopy(self.DEFAULT_SAVE_ARGS)
+        if save_args is not None:
+            self._save_args.update(save_args)
+
+        if overwrite and version is not None:
+            warn(
+                "Setting 'overwrite=True' is ineffective if versioning "
+                "is enabled, since the versioned path must not already "
+                "exist; overriding flag with 'overwrite=False' instead."
+            )
+            overwrite = False
+        self._overwrite = overwrite
+
+    def _describe(self) -> Dict[str, Any]:
+        return dict(
+            filepath=self._filepath,
+            protocol=self._protocol,
+            save_args=self._save_args,
+            version=self._version,
+        )
+
+    def _load(self) -> NoReturn:
+        raise DataSetError(f"Loading not supported for '{self.__class__.__name__}'")
+
+    def _save(self, html) -> None:
+        save_path = self._get_save_path()
+
+        if self._overwrite and self._exists():
+            self._fs.rm(get_filepath_str(save_path, self._protocol), recursive=True)
+
+        full_key_path = get_filepath_str(save_path, self._protocol)
+        with self._fs.open(full_key_path, **self._fs_open_args_save) as fs_file:
+            fs_file.write(html)
 
     def _exists(self) -> bool:
         load_path = get_filepath_str(self._get_load_path(), self._protocol)
