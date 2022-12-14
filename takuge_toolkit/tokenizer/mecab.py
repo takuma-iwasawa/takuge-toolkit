@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-from .base import BaseMorph, MorphList
-from typing import List, Dict, Iterable, Union, Optional
+from .base import BaseMorph, BaseMorphList
+from typing import List, Tuple, Dict, Sequence, Union, Optional
 import MeCab
 import re
 import unicodedata
 import regex
-from itertools import pairwise
+from itertools import pairwise, zip_longest
 from copy import copy
 
 
@@ -16,11 +16,11 @@ class MeCabTokenizer:
         self.normalize_form = normalize_form
         self.normalize_digit = normalize_digit
         self.stopwords = stopwords
-        self.parse_mecab_pattern = re.compile(r',|\t')
         self.katakana_pattern = regex.compile(r'[\p{Script=Katakana}ー]+')
 
-    def tokenize(self, sentence, extract_element_type: Union[str, List[str]] = 'lemma',
-                 extract_pos=None, extract_pos1=None, exclude_pos1=None, exclude_pos2=None, remove_eos=True,
+    def tokenize(self, sentence, extract_element_type: Union[str, List[str]] = 'lemma', remove_eos=True,
+                 extract_pos_combi_list: Optional[List[Union[Tuple[str, str], str]]] = None,
+                 exclude_pos_combi_list: Optional[List[Union[Tuple[str, str], str]]] = None,
                  concat_suffix_target: Optional[Union[Dict[str, str], List[Dict[str, str]]]] = None,
                  concat_suffix_like_noun_target: Optional[List[str]] = None,
                  concat_prefix_target: Optional[Union[Dict[str, str], List[Dict[str, str]]]] = None,
@@ -29,8 +29,8 @@ class MeCabTokenizer:
                  concat_katakana_nouns=False) -> List[str]:
         parsed_node_list = self.tokenize_as_mecab_format(sentence=sentence, remove_eos=remove_eos)
         return self.extract_words_from_mecab_format(
-            parsed_node_list=parsed_node_list, extract_element_type=extract_element_type, extract_pos=extract_pos,
-            extract_pos1=extract_pos1, exclude_pos1=exclude_pos1, exclude_pos2=exclude_pos2,
+            parsed_node_list=parsed_node_list, extract_element_type=extract_element_type,
+            extract_pos_combi_list=extract_pos_combi_list, exclude_pos_combi_list=exclude_pos_combi_list,
             concat_suffix_target=concat_suffix_target, concat_suffix_like_noun_target=concat_suffix_like_noun_target,
             concat_prefix_target=concat_prefix_target, concat_katakana_nouns=concat_katakana_nouns,
             max_concat_nouns=max_concat_nouns, concat_nouns_type=concat_nouns_type,
@@ -49,17 +49,14 @@ class MeCabTokenizer:
         return parsed_node_list[:-1] if remove_eos else parsed_node_list
 
     def extract_words_from_mecab_format(self, parsed_node_list, extract_element_type: Union[str, List[str]] = 'lemma',
-                                        extract_pos=None, extract_pos1=None, exclude_pos1=None, exclude_pos2=None,
+                                        extract_pos_combi_list: Optional[List[Union[Tuple[str, str], str]]] = None,
+                                        exclude_pos_combi_list: Optional[List[Union[Tuple[str, str], str]]] = None,
                                         concat_suffix_target: Optional[Union[Dict[str, str], List[Dict[str, str]]]] = None,
                                         concat_suffix_like_noun_target: Optional[List[str]] = None,
                                         concat_prefix_target: Optional[Union[Dict[str, str], List[Dict[str, str]]]] = None,
                                         max_concat_nouns: Union[bool, int] = False, concat_nouns_type: List[str] = None,
                                         concat_katakana_nouns=False) -> List[str]:
-        morph_attrs = ['surface', 'pos', 'pos1', 'pos2', 'pos3', 'ctype', 'cform', 'lemma', 'pronounce']
-        morphs = MeCabMorphList([
-            MeCabMorph(dict(zip(morph_attrs, self.parse_mecab_pattern.split(node))))
-            for node in parsed_node_list
-        ])
+        morphs = MeCabMorphList([MeCabMorph(**self._parse_mecab_node_str_list(node)) for node in parsed_node_list])
 
         if max_concat_nouns:
             morphs.concat_nouns(max_concats=max_concat_nouns, concat_nouns_type=concat_nouns_type)
@@ -85,10 +82,22 @@ class MeCabTokenizer:
         if self.stopwords:
             morphs.remove_stopwords(self.stopwords)
 
-        morphs.filter_morphs_by_pos(extract_pos=extract_pos, extract_pos1=extract_pos1,
-                                    exclude_pos1=exclude_pos1, exclude_pos2=exclude_pos2)
+        if extract_pos_combi_list or extract_pos_combi_list:
+            morphs.filter_morphs_by_pos(
+                extract_pos_combi_list=extract_pos_combi_list,
+                exclude_pos_combi_list=exclude_pos_combi_list,
+            )
 
         return morphs.get_concatenated_elements(element_types=extract_element_type)
+
+    @staticmethod
+    def _parse_mecab_node_str_list(parsed_node: str) -> Dict[str, str]:
+        morph_attrs = ['surface', 'pos', 'pos1', 'pos2', 'pos3', 'ctype', 'cform', 'lemma', 'reading', 'pronounce']
+
+        surface, attrs_str = parsed_node.rsplit('\t', maxsplit=1)
+        attrs = attrs_str.split(',')
+
+        return dict(zip_longest(morph_attrs, [surface] + attrs))
 
 
 class MeCabMorph(BaseMorph):
@@ -101,17 +110,23 @@ class MeCabMorph(BaseMorph):
     cform: str
     """活用形"""
 
+    reading: str
+    """読み"""
+
     pronounce: str
     """発音"""
 
     def __post_init__(self):
         for attr in self.__dict__.keys():
-            if self.__getattribute__(attr) == "*":
+            if attr != 'surface' and self.__getattribute__(attr) == "*":
                 setattr(self, attr, None)
 
+        if self.lemma is None:
+            self.lemma = self.surface
 
-class MeCabMorphList(MorphList):
-    def __init__(self, morphs_list: Iterable[MeCabMorph]):
+
+class MeCabMorphList(BaseMorphList):
+    def __init__(self, morphs_list: Sequence[MeCabMorph]):
         super().__init__(morphs_list=morphs_list)
 
     def concat_suffix(self, target_pos: Optional[str] = None, target_regex: Optional[str] = None,
@@ -315,4 +330,3 @@ class MeCabMorphList(MorphList):
 
     def remove_stopwords(self, stopwords: List[str]):
         self.morphs_list = [morph for morph in self.morphs_list if morph.lemma not in stopwords]
-
